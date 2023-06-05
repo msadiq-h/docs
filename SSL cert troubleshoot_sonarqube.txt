@@ -1,0 +1,299 @@
+# Copyright: (c) 2022, Jordan Borean (@jborean93) <jborean93@gmail.com>
+# MIT License (see LICENSE or https://opensource.org/licenses/MIT)
+
+Function Trace-TlsHandshake {
+    <#
+    .SYNOPSIS
+    TLS Handshake Diagnostics.
+
+    .DESCRIPTION
+    Performs a TLS handshake and returns diagnostic information about that
+    exchange. It can also be used to capture the raw TLS packets used in the
+    exchange through the -CapturePacket switch.
+
+    .PARAMETER HostName
+    The hostname to connect to.
+
+    .PARAMETER Port
+    The port to connect to, defaults to 443 which is commonly used for https.
+
+    .PARAMETER Protocol
+    The TLS protocol to restrict the handshake to. The default will use the
+    OS defaults but this can be used to use a specific protocol.
+
+    .PARAMETER CipherSuite
+    Override the cipher suite selection policy. The default will use the OS
+    defaults. Currently only Linux and macOS can define an explicit cipher
+    suite policy. The dotnet API does not support this for Windows
+    https://github.com/dotnet/runtime/issues/23818.
+
+    .PARAMETER CapturePacket
+    Capture the raw TLS packets and store them in the output Packets property.
+    This is experimental but can be used to analyze data not available through
+    PowerShell/.NET.
+
+    .EXAMPLE
+    Trace-TlsHandshake -HostName google.com
+
+    .OUTPUTS
+    This cmdlet outputs an object with the following properties:
+
+        Protocol
+        The TLS protocol that was negotiated. The values correspond to the
+        SslProtocols enum
+        https://docs.microsoft.com/en-us/dotnet/api/system.security.authentication.sslprotocols?view=net-6.0
+
+        Cipher
+        The cipher suite which was negotiated. The values correspond to the
+        TlsCipherSuite enum
+        https://docs.microsoft.com/en-us/dotnet/api/system.net.security.tlsciphersuite?view=net-6.0
+
+        KeyStrength
+        The strength of the key exchange algorithm that was negotiated.
+
+        Certificate
+        The certificate of the target host.
+
+        Chain
+        A chain of certificate authorities associated with the remote
+        certificate.
+
+        VerificationStatus
+        The cert verifcation result. The values can be set to the following:
+
+            None - No errors, verification succeeded
+            RemoteCertificateChainErrors - Errors in the chain
+            RemoteCertificateNameMismatch - Certificate name mismatched
+            RemoteCertificateNotAvailable - No certificate was available
+
+            The enums are based off
+            https://docs.microsoft.com/en-us/dotnet/api/system.net.security.sslpolicyerrors?view=net-6.0
+
+
+        Packets:
+        The raw TLS packets that were exchanged from the client and host. This
+        will be empty if -CapturePacket was not set.
+
+
+    The object in the Packets list contain the following properties:
+
+        Direction:
+        The direction of the packet; Outgoing for packets sent from the client
+        and Incoming for packets sent from the server.
+
+        ContentType:
+        The raw content type of the TLS record.
+
+        Version:
+        The raw version id of the TLS record.
+
+        Length:
+        The length of the TLS record payload
+
+        Data:
+        The full TLS record packet, this contains both the TLS record header
+        (first 5 bytes) as well as the remaining payload (size of Length).
+
+    .NOTES
+    This cmdlet is designed to replicate some of the same functionality that
+    exists in the openssl s_client -connect command.
+
+    This must run with PowerShell 7+.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]
+        $HostName,
+
+        [Parameter()]
+        [int]
+        $Port = 443,
+
+        [Parameter()]
+        [System.Security.Authentication.SslProtocols]
+        $Protocol = [System.Security.Authentication.SslProtocols]::None,
+
+        [Parameter()]
+        [System.Net.Security.CipherSuitesPolicy]
+        $CipherSuite = $null,
+
+        [Parameter()]
+        [switch]
+        $CapturePacket
+    )
+
+    $bufferSize = 16KB
+    $pipeName = "tls-test-$([Guid]::NewGuid())"
+    try {
+        Write-Verbose -Message "Connecting to $($HostName):$Port"
+        $socket = [System.Net.Sockets.TcpClient]::new($HostName, $Port)
+        $socketStream = $socket.GetStream()
+
+        Write-Verbose -Message "Creating named pipe for packet capture called '$pipeName'"
+        $serverPipe = [System.IO.Pipes.NamedPipeServerStream]::new(
+            $pipeName,
+            [System.IO.Pipes.PipeDirection]::InOut,
+            1,
+            [System.IO.Pipes.PipeTransmissionMode]::Byte,
+            [System.IO.Pipes.PipeOptions]"Asynchronous, CurrentUserOnly",
+            $bufferSize,
+            $bufferSize
+        )
+        $clientPipe = [System.IO.Pipes.NamedPipeClientStream]::new(
+            ".",
+            $pipeName,
+            [System.IO.Pipes.PipeDirection]::InOut,
+            [System.IO.Pipes.PipeOptions]"Asynchronous, CurrentUserOnly"
+        )
+
+        Write-Verbose -Message "Connecting client and server named pipes"
+        $waitTask = $serverPipe.WaitForConnectionAsync()
+        $clientPipe.Connect()
+        while (-not $waitTask.AsyncWaitHandle.WaitOne(200)) { }
+        $null = $waitTask.GetAwaiter().GetResult()
+
+        $tlsPipeRecorder = {
+            [CmdletBinding()]
+            param (
+                [Parameter(Mandatory)]
+                [string]
+                $Id,
+
+                [Parameter(Mandatory)]
+                [System.IO.Stream]
+                $Incoming,
+
+                [Parameter(Mandatory)]
+                [System.IO.Stream]
+                $Outgoing,
+
+                [Parameter(Mandatory)]
+                [AllowEmptyCollection()]
+                [System.Collections.Generic.List[PSObject]]
+                $MessageList,
+
+                [Parameter(Mandatory)]
+                [System.Threading.CancellationToken]
+                $CancelToken
+            )
+
+            try {
+                $buffer = [byte[]]::new(16KB)
+                while ($true) {
+                    $task = $Incoming.ReadAsync($buffer, 0, 5, $CancelToken)
+                    while (-not $task.AsyncWaitHandle.WaitOne(200)) { }
+                    $null = $task.GetAwaiter().GetResult()
+
+                    # The length of the TLS Record is a big endian UInt16 value
+                    $msgLength = (([uint16]$buffer[3]) -shl 8) -bor $buffer[4]
+                    $null = $Incoming.Read($buffer, 5, $msgLength)
+                    $Outgoing.Write($buffer, 0, $msgLength + 5)
+                    $Outgoing.Flush()
+
+                    $msgObj = [PSCustomObject]@{
+                        PSTypeName  = 'Tls.Record'
+                        Direction   = $Id
+                        ContentType = $buffer[0]
+                        Version     = (([uint16]$buffer[1]) -shl 8) -bor $buffer[2]
+                        Length      = $msgLength
+                        Data        = [byte[]]($buffer[0..($msgLength + 4)])
+                    }
+                    $MessageList.Add($msgObj)
+                }
+            }
+            catch [System.OperationCanceledException] {}
+            catch {
+                [Console]::WriteLine("$Id Failed - $_")
+                throw
+            }
+        }
+
+        $cancelToken = [System.Threading.CancellationTokenSource]::new()
+        $msgList = [System.Collections.Generic.List[PSObject]]::new()
+        $backgroundTasks = @(if ($CapturePacket) {
+                $psRead = [PowerShell]::Create()
+                $psRead.AddScript($tlsPipeRecorder).AddParameters(@{
+                        Id          = "Outgoing"
+                        Incoming    = $clientPipe
+                        Outgoing    = $socketStream
+                        MessageList = $msgList
+                        CancelToken = $cancelToken.Token
+                    }).InvokeAsync()
+                $psWrite = [PowerShell]::Create()
+                $psWrite.AddScript($tlsPipeRecorder).AddParameters(@{
+                        Id          = "Incoming"
+                        Incoming    = $socketStream
+                        Outgoing    = $clientPipe
+                        MessageList = $msgList
+                        CancelToken = $cancelToken.Token
+                    }).InvokeAsync()
+            })
+
+        $sslOptions = @{
+            EnabledSslProtocols = $Protocol
+            TargetHost          = $HostName
+        }
+        if ($CipherSuite) {
+            $sslOptions.CipherSuitesPolicy = $CipherSuite
+        }
+
+        $certCallback = {
+            [CmdletBinding()]
+            param (
+                [object]$SenderObj,
+                [System.Security.Cryptography.X509Certificates.X509Certificate]$Certificate,
+                [System.Security.Cryptography.X509Certificates.X509Chain]$Chain,
+                [System.Net.Security.SslPolicyErrors]$PolicyErrors
+            )
+
+            $SenderObj._CertCallbackBag.Certificate = $Certificate
+            $SenderObj._CertCallbackBag.Chain = $Chain
+            $SenderObj._CertCallbackBag.PolicyErrors = $PolicyErrors
+            $true
+        }
+        $targetStream = $CapturePacket ? $serverPipe : $socketStream
+        $tlsStream = [System.Net.Security.SslStream]::new($targetStream, $true, $certCallback)
+
+        # This is used in the callback to smuggle back the callback params
+        $callbackInfo = @{}
+        $tlsStream.PSObject.Properties.Add(
+            [System.Management.Automation.PSNoteProperty]::new('_CertCallbackBag', $callbackInfo))
+
+        Write-Verbose "Starting TLS Handshake"
+        try {
+            $tlsStream.AuthenticateAsClient($sslOptions)
+            Write-Verbose "TLS Handshake complete"
+        }
+        catch {
+            # The exception here may contain an unhelpful see inner exception,
+            # raise the inner exception to display a more helpful error.
+            $exp = $_.Exception.InnerException
+            if ($exp.Message -like "*see inner exception*") {
+                $exp = $exp.InnerException
+            }
+
+            $err = [System.Management.Automation.ErrorRecord]::new(
+                $exp,
+                "TLSHandsakeFailure",
+                [System.Management.Automation.ErrorCategory]::ProtocolError,
+                $HostName)
+            $err.ErrorDetails = "TLS Handshake Failure: $($exp.Message)"
+            $PSCmdlet.WriteError($err)
+        }
+        finally {
+            $cancelToken.Cancel()
+            foreach ($task in $backgroundTasks) {
+                while (-not $task.AsyncWaitHandle.WaitOne(200)) { }
+                $task.GetAwaiter().GetResult()
+            }
+        }
+
+        [PSCustomObject]@{
+            PSTypeName         = 'Tls.Handshake'
+            Protocol           = $tlsStream.SslProtocol
+            Cipher             = $tlsStream.NegotiatedCipherSuite
+            KeyStrength        = $tlsStream.KeyExchangeStrength
+            Certificate        = $callbackInfo.Certificate
+            Chain              = $callbackInfo.Chain
+            VerificationStatus = $callbackInfo.PolicyErrors
