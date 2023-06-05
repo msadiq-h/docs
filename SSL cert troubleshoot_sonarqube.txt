@@ -297,3 +297,14 @@ Function Trace-TlsHandshake {
             Certificate        = $callbackInfo.Certificate
             Chain              = $callbackInfo.Chain
             VerificationStatus = $callbackInfo.PolicyErrors
+            Packets            = $msgList
+        }
+    }
+    finally {
+        ${socketStream}?.Dispose()
+        ${socket}?.Dispose()
+        ${tlsStream}?.Dispose()
+        ${clientPipe}?.Dispose()
+        ${serverPipe}?.Dispose()
+    }
+}
